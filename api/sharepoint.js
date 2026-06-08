@@ -69,23 +69,36 @@ export default async function handler(req, res) {
       const { refCode } = req.query;
       console.log("[load] refCode:", refCode);
       const appListId = await getListId(token, siteId, "WorkBC Applications");
-      const appResp = await fetch(
-        `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${appListId}/items?$filter=fields/ReferenceCode eq '${refCode}'&$expand=fields`,
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      const appData = await appResp.json();
-      const f = appData.value?.[0]?.fields;
-      if (!f) {
-        console.log("[load] Not found");
-        return res.status(404).json({ error: "Not found" });
+
+      // Fetch all items and filter in code — avoids Graph API filter issues on custom columns
+      let appItems = [];
+      let nextLink = `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${appListId}/items?$expand=fields&$top=999`;
+      while (nextLink) {
+        const appResp = await fetch(nextLink, { headers: { Authorization: `Bearer ${token}` } });
+        const appData = await appResp.json();
+        appItems = appItems.concat(appData.value || []);
+        nextLink = appData["@odata.nextLink"] || null;
       }
 
+      const match = appItems.find(item => item.fields?.ReferenceCode === refCode);
+      const f = match?.fields;
+      if (!f) {
+        console.log("[load] Not found for refCode:", refCode);
+        console.log("[load] Available codes:", appItems.map(i => i.fields?.ReferenceCode));
+        return res.status(404).json({ error: "Not found" });
+      }
+      console.log("[load] Found:", f.OrgName);
+
       const jobListId = await getListId(token, siteId, "WorkBC Jobs");
-      const jobResp = await fetch(
-        `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${jobListId}/items?$filter=fields/ReferenceCode eq '${refCode}'&$expand=fields`,
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      const jobData = await jobResp.json();
+      let jobItems = [];
+      let jobNextLink = `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${jobListId}/items?$expand=fields&$top=999`;
+      while (jobNextLink) {
+        const jobResp = await fetch(jobNextLink, { headers: { Authorization: `Bearer ${token}` } });
+        const jobData = await jobResp.json();
+        jobItems = jobItems.concat(jobData.value || []);
+        jobNextLink = jobData["@odata.nextLink"] || null;
+      }
+      const jobData = { value: jobItems.filter(item => item.fields?.ReferenceCode === refCode) };
       const jobs = (jobData.value || []).map(item => ({
         id: item.id,
         positionTitle: item.fields.PositionTitle || "",
@@ -129,12 +142,13 @@ export default async function handler(req, res) {
       console.log("[save] refCode:", refCode);
       const appListId = await getListId(token, siteId, "WorkBC Applications");
 
+      // Fetch all and find by refCode in memory — Graph filter on custom columns is unreliable
       const checkResp = await fetch(
-        `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${appListId}/items?$filter=fields/ReferenceCode eq '${refCode}'&$expand=fields`,
+        `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${appListId}/items?$expand=fields&$top=999`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
       const checkData = await checkResp.json();
-      const existing = checkData.value?.[0];
+      const existing = (checkData.value || []).find(item => item.fields?.ReferenceCode === refCode);
 
       const fields = {
         ReferenceCode: refCode,
@@ -173,15 +187,31 @@ export default async function handler(req, res) {
           throw new Error("PATCH failed: " + JSON.stringify(err));
         }
       } else {
-        console.log("[save] Creating new item");
-        const postResp = await fetch(
-          `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${appListId}/items`,
-          { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ fields }) }
+        // Double-check before creating — race condition guard
+        const recheck = await fetch(
+          `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${appListId}/items?$filter=fields/ReferenceCode eq '${refCode}'&$expand=fields&$top=1`,
+          { headers: { Authorization: `Bearer ${token}` } }
         );
-        if (!postResp.ok) {
-          const err = await postResp.json();
-          console.error("[save] POST failed:", JSON.stringify(err));
-          throw new Error("POST failed: " + JSON.stringify(err));
+        const recheckData = await recheck.json();
+        if (recheckData.value?.[0]) {
+          // Already exists — update instead
+          const existingId = recheckData.value[0].id;
+          console.log("[save] Race guard — updating:", existingId);
+          await fetch(
+            `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${appListId}/items/${existingId}/fields`,
+            { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(fields) }
+          );
+        } else {
+          console.log("[save] Creating new item");
+          const postResp = await fetch(
+            `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${appListId}/items`,
+            { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ fields }) }
+          );
+          if (!postResp.ok) {
+            const err = await postResp.json();
+            console.error("[save] POST failed:", JSON.stringify(err));
+            throw new Error("POST failed: " + JSON.stringify(err));
+          }
         }
       }
       console.log("[save] OK");
@@ -195,11 +225,12 @@ export default async function handler(req, res) {
       const jobListId = await getListId(token, siteId, "WorkBC Jobs");
 
       const existingResp = await fetch(
-        `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${jobListId}/items?$filter=fields/ReferenceCode eq '${refCode}'&$expand=fields`,
+        `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${jobListId}/items?$expand=fields&$top=999`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
       const existingData = await existingResp.json();
-      for (const item of existingData.value || []) {
+      const existingJobs = (existingData.value || []).filter(item => item.fields?.ReferenceCode === refCode);
+      for (const item of existingJobs) {
         await fetch(
           `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${jobListId}/items/${item.id}`,
           { method: "DELETE", headers: { Authorization: `Bearer ${token}` } }
